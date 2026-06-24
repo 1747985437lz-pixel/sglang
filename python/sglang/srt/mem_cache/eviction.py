@@ -36,6 +36,10 @@ def describe_tree_cache_for_oom(tree_cache: BasePrefixCache | None) -> str:
     return tree_cache.available_and_evictable_str()
 
 
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()
+
+
 class CacheFreeSpaceProvider:
     """FreeSpaceProvider backed by a prefix cache: makes room by evicting the
     radix tree, and reports the cache's availability on OOM."""
