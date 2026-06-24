@@ -2051,6 +2051,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             ensure_num_free_tokens=lambda n: evict_from_tree_cache(self.tree_cache, n),
             describe_for_oom=lambda: describe_tree_cache_for_oom(self.tree_cache),
+            reserve_mamba_slots=lambda num_reqs: self.req_to_token_pool.reserve_mamba_slots(
+                num_reqs, self.tree_cache
+            ),
         )
 
         # Set fields
