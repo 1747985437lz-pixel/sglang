@@ -9,7 +9,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.kv_cache_utils import (
     MAMBA_STATE_PER_REQ_NO_CACHE,
@@ -81,10 +80,12 @@ def free_swa_out_of_window_slots(
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
+    *,
+    ensure_num_free_tokens: Callable[[int], None],
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
+    ensure_num_free_tokens(num_tokens)
 
     state = None
     if backup_state:
@@ -104,32 +105,6 @@ def alloc_token_slots(
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
-
-
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
-        return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -159,6 +134,8 @@ def alloc_paged_token_slots_extend(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     extend_num_tokens: int,
+    *,
+    ensure_num_free_tokens: Callable[[int], None],
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
@@ -167,7 +144,7 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    ensure_num_free_tokens(num_tokens)
 
     state = None
     if backup_state:
@@ -264,6 +241,8 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    *,
+    ensure_num_free_tokens: Callable[[int], None],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -293,7 +272,11 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     if _alloc_page_size(batch) == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            batch.extend_num_tokens,
+            ensure_num_free_tokens=ensure_num_free_tokens,
+        )
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -308,6 +291,7 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+            ensure_num_free_tokens=ensure_num_free_tokens,
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
@@ -346,6 +330,8 @@ def alloc_paged_token_slots_decode(
     seq_lens: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
+    *,
+    ensure_num_free_tokens: Callable[[int], None],
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
@@ -355,7 +341,7 @@ def alloc_paged_token_slots_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
+    ensure_num_free_tokens(num_tokens)
 
     # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
     # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
@@ -394,7 +380,12 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode(
+    batch: ScheduleBatch,
+    token_per_req: int,
+    *,
+    ensure_num_free_tokens: Callable[[int], None],
+) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
@@ -409,7 +400,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            bs * token_per_req,
+            ensure_num_free_tokens=ensure_num_free_tokens,
+        )
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -421,6 +416,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             seq_lens=seq_lens_next,
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
+            ensure_num_free_tokens=ensure_num_free_tokens,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
