@@ -87,7 +87,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_cache_utils import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.eviction import (
-    describe_tree_cache_for_oom,
+    CacheFreeSpaceProvider,
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.owned_kv import (
@@ -2049,9 +2049,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self,
-            ensure_num_free_tokens=lambda n: evict_from_tree_cache(self.tree_cache, n),
-            describe_for_oom=lambda: describe_tree_cache_for_oom(self.tree_cache),
-            reserve_mamba_slots=lambda num_reqs: self.req_to_token_pool.reserve_mamba_slots(
+            space=CacheFreeSpaceProvider(self.tree_cache),
+            reserve_req_state_slots=lambda num_reqs: self.req_to_token_pool.reserve_mamba_slots(
                 num_reqs, self.tree_cache
             ),
         )
@@ -2656,8 +2655,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = alloc_for_decode(
             self,
             token_per_req=1,
-            ensure_num_free_tokens=lambda n: evict_from_tree_cache(self.tree_cache, n),
-            describe_for_oom=lambda: describe_tree_cache_for_oom(self.tree_cache),
+            space=CacheFreeSpaceProvider(self.tree_cache),
         )
 
         # Update req-level memory management fields

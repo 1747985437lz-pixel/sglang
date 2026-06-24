@@ -34,3 +34,17 @@ def describe_tree_cache_for_oom(tree_cache: BasePrefixCache | None) -> str:
     if tree_cache is not None:
         tree_cache.pretty_print()
     return tree_cache.available_and_evictable_str()
+
+
+class CacheFreeSpaceProvider:
+    """FreeSpaceProvider backed by a prefix cache: makes room by evicting the
+    radix tree, and reports the cache's availability on OOM."""
+
+    def __init__(self, tree_cache: BasePrefixCache | None) -> None:
+        self.tree_cache = tree_cache
+
+    def ensure_free(self, num_tokens: int) -> None:
+        evict_from_tree_cache(self.tree_cache, num_tokens)
+
+    def describe_for_oom(self) -> str:
+        return describe_tree_cache_for_oom(self.tree_cache)

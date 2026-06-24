@@ -10,10 +10,7 @@ from sglang.srt.mem_cache.kv_cache_utils import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
-from sglang.srt.mem_cache.eviction import (
-    describe_tree_cache_for_oom,
-    evict_from_tree_cache,
-)
+from sglang.srt.mem_cache.eviction import CacheFreeSpaceProvider
 from sglang.srt.mem_cache.owned_kv import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -89,10 +86,7 @@ class EagleDraftInputV2Mixin:
             out_cache_loc = alloc_token_slots(
                 batch.token_to_kv_pool_allocator,
                 num_needed_tokens,
-                ensure_num_free_tokens=lambda n: evict_from_tree_cache(
-                    batch.tree_cache, n
-                ),
-                describe_for_oom=lambda: describe_tree_cache_for_oom(batch.tree_cache),
+                space=CacheFreeSpaceProvider(batch.tree_cache),
             )
         else:
             last_loc = get_last_loc(
@@ -108,10 +102,7 @@ class EagleDraftInputV2Mixin:
                 nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
-                ensure_num_free_tokens=lambda n: evict_from_tree_cache(
-                    batch.tree_cache, n
-                ),
-                describe_for_oom=lambda: describe_tree_cache_for_oom(batch.tree_cache),
+                space=CacheFreeSpaceProvider(batch.tree_cache),
             )
 
         assign_req_to_token_pool_func(
