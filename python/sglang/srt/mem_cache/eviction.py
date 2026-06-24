@@ -34,3 +34,7 @@ def describe_tree_cache_for_oom(tree_cache: BasePrefixCache | None) -> str:
     if tree_cache is not None:
         tree_cache.pretty_print()
     return tree_cache.available_and_evictable_str()
+
+
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()
