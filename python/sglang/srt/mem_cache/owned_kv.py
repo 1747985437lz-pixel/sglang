@@ -17,10 +17,8 @@ from sglang.srt.mem_cache.kv_cache_utils import (
     write_cache_indices,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 
-_is_hip = is_hip()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -78,13 +76,13 @@ def free_swa_out_of_window_slots(
 
 
 def alloc_token_slots(
-    tree_cache: BasePrefixCache,
+    allocator: BaseTokenToKVPoolAllocator,
     num_tokens: int,
     *,
     ensure_num_free_tokens: Callable[[int], None],
+    describe_for_oom: Callable[[], str],
     backup_state: bool = False,
 ):
-    allocator = tree_cache.token_to_kv_pool_allocator
     ensure_num_free_tokens(num_tokens)
 
     state = None
@@ -97,11 +95,9 @@ def alloc_token_slots(
         error_msg = (
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{describe_for_oom()}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -127,7 +123,7 @@ def _compute_dsv4_state_lens(batch, *, is_decode: bool):
 
 
 def alloc_paged_token_slots_extend(
-    tree_cache: BasePrefixCache,
+    allocator: BaseTokenToKVPoolAllocator,
     prefix_lens: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -136,13 +132,13 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     *,
     ensure_num_free_tokens: Callable[[int], None],
+    describe_for_oom: Callable[[], str],
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
-    allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     ensure_num_free_tokens(num_tokens)
 
@@ -183,11 +179,9 @@ def alloc_paged_token_slots_extend(
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{describe_for_oom()}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
@@ -227,22 +221,11 @@ def alloc_req_slots(
     return req_pool_indices
 
 
-def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
-    # server_args.page_size * dcp_size, so it can be > 1 even when
-    # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
-    # path do we branch on the real allocator's page_size so the paged path is
-    # taken; everywhere else tree_cache.page_size is authoritative and the two
-    # are equal (dcp_size == 1), so behavior is unchanged.
-    if _is_hip and get_global_server_args().dcp_size > 1:
-        return batch.tree_cache.token_to_kv_pool_allocator.page_size
-    return batch.tree_cache.page_size
-
-
 def alloc_for_extend(
     batch: ScheduleBatch,
     *,
     ensure_num_free_tokens: Callable[[int], None],
+    describe_for_oom: Callable[[], str],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -271,11 +254,12 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if _alloc_page_size(batch) == 1:
+    if batch.token_to_kv_pool_allocator.page_size == 1:
         out_cache_loc = alloc_token_slots(
-            batch.tree_cache,
+            batch.token_to_kv_pool_allocator,
             batch.extend_num_tokens,
             ensure_num_free_tokens=ensure_num_free_tokens,
+            describe_for_oom=describe_for_oom,
         )
     else:
         # Paged allocation - build last_loc
@@ -284,7 +268,7 @@ def alloc_for_extend(
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
+            allocator=batch.token_to_kv_pool_allocator,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=batch.seq_lens,
@@ -292,6 +276,7 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
             ensure_num_free_tokens=ensure_num_free_tokens,
+            describe_for_oom=describe_for_oom,
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
@@ -326,19 +311,19 @@ def alloc_for_extend(
 
 
 def alloc_paged_token_slots_decode(
-    tree_cache: BasePrefixCache,
+    allocator: BaseTokenToKVPoolAllocator,
     seq_lens: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     *,
     ensure_num_free_tokens: Callable[[int], None],
+    describe_for_oom: Callable[[], str],
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
-    allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
     ensure_num_free_tokens(num_tokens)
@@ -370,11 +355,9 @@ def alloc_paged_token_slots_decode(
         error_msg = (
             f"Decode out of memory. Try to lower your batch size.\n"
             f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}"
+            f"{describe_for_oom()}"
         )
         logger.error(error_msg)
-        if tree_cache is not None:
-            tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
     return out_cache_loc
@@ -385,6 +368,7 @@ def alloc_for_decode(
     token_per_req: int,
     *,
     ensure_num_free_tokens: Callable[[int], None],
+    describe_for_oom: Callable[[], str],
 ) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
@@ -398,12 +382,13 @@ def alloc_for_decode(
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if _alloc_page_size(batch) == 1:
+    if batch.token_to_kv_pool_allocator.page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(
-            batch.tree_cache,
+            batch.token_to_kv_pool_allocator,
             bs * token_per_req,
             ensure_num_free_tokens=ensure_num_free_tokens,
+            describe_for_oom=describe_for_oom,
         )
     else:
         # Paged allocation
@@ -412,11 +397,12 @@ def alloc_for_decode(
         ]
         seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
+            allocator=batch.token_to_kv_pool_allocator,
             seq_lens=seq_lens_next,
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             ensure_num_free_tokens=ensure_num_free_tokens,
+            describe_for_oom=describe_for_oom,
             token_per_req=token_per_req,
             req_pool_indices=batch.req_pool_indices,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
@@ -443,7 +429,3 @@ def alloc_for_decode(
         )
 
     return out_cache_loc
-
-
-def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
-    return tree_cache.available_and_evictable_str()

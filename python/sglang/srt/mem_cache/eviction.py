@@ -28,3 +28,9 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+
+
+def describe_tree_cache_for_oom(tree_cache: BasePrefixCache | None) -> str:
+    if tree_cache is not None:
+        tree_cache.pretty_print()
+    return tree_cache.available_and_evictable_str()

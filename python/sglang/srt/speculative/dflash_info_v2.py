@@ -9,7 +9,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_cache_utils import get_last_loc
-from sglang.srt.mem_cache.eviction import evict_from_tree_cache
+from sglang.srt.mem_cache.eviction import (
+    describe_tree_cache_for_oom,
+    evict_from_tree_cache,
+)
 from sglang.srt.mem_cache.owned_kv import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -230,10 +233,13 @@ class DFlashDraftInputV2(SpecInput):
             if num_needed_tokens > 0:
                 if page_size == 1:
                     out_cache_loc = alloc_token_slots(
-                        batch.tree_cache,
+                        batch.token_to_kv_pool_allocator,
                         num_needed_tokens,
                         ensure_num_free_tokens=lambda n: evict_from_tree_cache(
                             batch.tree_cache, n
+                        ),
+                        describe_for_oom=lambda: describe_tree_cache_for_oom(
+                            batch.tree_cache
                         ),
                     )
                 else:
@@ -243,7 +249,7 @@ class DFlashDraftInputV2(SpecInput):
                         cur_kv_lens,
                     )
                     out_cache_loc = alloc_paged_token_slots_extend(
-                        batch.tree_cache,
+                        batch.token_to_kv_pool_allocator,
                         cur_kv_lens,
                         cur_kv_lens_cpu_t,
                         nxt_kv_lens,
@@ -252,6 +258,9 @@ class DFlashDraftInputV2(SpecInput):
                         num_needed_tokens,
                         ensure_num_free_tokens=lambda n: evict_from_tree_cache(
                             batch.tree_cache, n
+                        ),
+                        describe_for_oom=lambda: describe_tree_cache_for_oom(
+                            batch.tree_cache
                         ),
                     )
 
